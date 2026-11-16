@@ -177,3 +177,36 @@ query ?
 SELECT make_dt_interval(-106751992, 0, 0, 0);
 ----
 NULL
+
+# Mixed-sign cancellation checks (Spark raises INTERVAL_ARITHMETIC_OVERFLOW, returns NULL pending #20)
+query ?
+SELECT make_dt_interval(106751992, -24, 0, 0);
+----
+NULL
+
+query ?
+SELECT make_dt_interval(106751991, 5, -60, 0);
+----
+NULL
+
+# Exact i64::MAX and i64::MIN boundary assertions (https://github.com/apache/datafusion-spark/issues/109)
+query ?
+SELECT make_dt_interval(106751991, 4, 0, 54.775807);
+----
+106751991 days 4 hours 0 mins 54.775807 secs
+
+query ?
+SELECT make_dt_interval(-106751991, -4, 0, -54.775808);
+----
+-106751991 days -4 hours 0 mins -54.775808 secs
+
+# One microsecond beyond boundaries returns NULL (overflow tracked in #20)
+query ?
+SELECT make_dt_interval(106751991, 4, 0, 54.775808);
+----
+NULL
+
+query ?
+SELECT make_dt_interval(-106751991, -4, 0, -54.775809);
+----
+NULL

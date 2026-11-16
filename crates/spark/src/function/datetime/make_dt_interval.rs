@@ -226,24 +226,17 @@ fn make_dt_interval_kernel(args: &[ArrayRef]) -> Result<ArrayRef, DataFusionErro
     Ok(Arc::new(builder.finish()))
 }
 fn make_interval_dt_nano(day: i32, hour: i32, min: i32, sec: f64) -> Option<i64> {
-    const HOURS_PER_DAY: i64 = 24;
-    const MINS_PER_HOUR: i64 = 60;
-    const SECS_PER_MINUTE: i64 = 60;
     const MICROS_PER_SEC: i64 = 1_000_000;
+    const MICROS_PER_MINUTE: i64 = 60 * MICROS_PER_SEC;
+    const MICROS_PER_HOUR: i64 = 60 * MICROS_PER_MINUTE;
+    const MICROS_PER_DAY: i64 = 24 * MICROS_PER_HOUR;
     const MAX_SECS_ABS: f64 = (1i64 << 53) as f64;
 
     if !sec.is_finite() || sec <= -MAX_SECS_ABS || sec >= MAX_SECS_ABS {
         return None;
     }
 
-    let total_hours: i64 = (day as i64)
-        .checked_mul(HOURS_PER_DAY)
-        .and_then(|v| v.checked_add(hour as i64))?;
-
-    let total_mins: i64 = total_hours
-        .checked_mul(MINS_PER_HOUR)
-        .and_then(|v| v.checked_add(min as i64))?;
-
+    // Step 1: Convert seconds (whole and fractional) to microseconds
     let mut sec_whole: i64 = sec.trunc() as i64;
     let sec_frac: f64 = sec - (sec_whole as f64);
     let mut frac_us: i64 = (sec_frac * (MICROS_PER_SEC as f64)).round() as i64;
@@ -256,13 +249,28 @@ fn make_interval_dt_nano(day: i32, hour: i32, min: i32, sec: f64) -> Option<i64>
         sec_whole = sec_whole.checked_sub(1)?;
     }
 
-    let total_secs: i64 = total_mins
-        .checked_mul(SECS_PER_MINUTE)
-        .and_then(|v| v.checked_add(sec_whole))?;
+    let sec_us: i64 = sec_whole
+        .checked_mul(MICROS_PER_SEC)?
+        .checked_add(frac_us)?;
 
-    let total_us = total_secs
-        .checked_mul(MICROS_PER_SEC)
-        .and_then(|v| v.checked_add(frac_us))?;
+    // Step 2: Accumulate components sequentially in microseconds, matching Spark's
+    // exact IntervalUtils.makeDayTimeInterval evaluation order:
+    //   var micros = secs.toUnscaledLong
+    //   micros = Math.addExact(micros, Math.multiplyExact(days, MICROS_PER_DAY))
+    //   micros = Math.addExact(micros, Math.multiplyExact(hours, MICROS_PER_HOUR))
+    //   micros = Math.addExact(micros, Math.multiplyExact(mins, MICROS_PER_MINUTE))
+    // Checking each addition and multiplication independently prevents opposite-sign
+    // components from cancelling an intermediate overflow.
+    let mut total_us = sec_us;
+
+    let day_us = (day as i64).checked_mul(MICROS_PER_DAY)?;
+    total_us = total_us.checked_add(day_us)?;
+
+    let hour_us = (hour as i64).checked_mul(MICROS_PER_HOUR)?;
+    total_us = total_us.checked_add(hour_us)?;
+
+    let min_us = (min as i64).checked_mul(MICROS_PER_MINUTE)?;
+    total_us = total_us.checked_add(min_us)?;
 
     Some(total_us)
 }
@@ -883,6 +891,88 @@ mod tests {
         assert_eq!(out.len(), 4);
         for i in 0..4 {
             assert!(out.is_null(i), "row {i} should be NULL for extreme seconds");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_sign_intermediate_day_overflow_returns_null() -> Result<()> {
+        // (106751992, -24, 0, 0): day * MICROS_PER_DAY overflows i64.
+        // In Spark, Math.multiplyExact fails immediately before subtracting 24 hours.
+        let days = Arc::new(Int32Array::from(vec![Some(106_751_992)])) as ArrayRef;
+        let hours = Arc::new(Int32Array::from(vec![Some(-24)])) as ArrayRef;
+        let mins = Arc::new(Int32Array::from(vec![Some(0)])) as ArrayRef;
+        let secs = Arc::new(Float64Array::from(vec![Some(0.0)])) as ArrayRef;
+
+        let out = run_make_dt_interval(vec![days, hours, mins, secs])?;
+        let out = out
+            .as_any()
+            .downcast_ref::<DurationMicrosecondArray>()
+            .ok_or_else(|| {
+                internal_datafusion_err!("expected DurationMicrosecondArray")
+            })?;
+
+        assert_eq!(out.len(), 1);
+        assert!(out.is_null(0), "intermediate day overflow must return NULL");
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_sign_intermediate_hour_overflow_returns_null() -> Result<()> {
+        // (106751991, 5, -60, 0): days_us + 5 hours overflows i64 before subtracting 60 mins.
+        // In Spark, Math.addExact fails at the hour step.
+        let days = Arc::new(Int32Array::from(vec![Some(106_751_991)])) as ArrayRef;
+        let hours = Arc::new(Int32Array::from(vec![Some(5)])) as ArrayRef;
+        let mins = Arc::new(Int32Array::from(vec![Some(-60)])) as ArrayRef;
+        let secs = Arc::new(Float64Array::from(vec![Some(0.0)])) as ArrayRef;
+
+        let out = run_make_dt_interval(vec![days, hours, mins, secs])?;
+        let out = out
+            .as_any()
+            .downcast_ref::<DurationMicrosecondArray>()
+            .ok_or_else(|| {
+                internal_datafusion_err!("expected DurationMicrosecondArray")
+            })?;
+
+        assert_eq!(out.len(), 1);
+        assert!(
+            out.is_null(0),
+            "intermediate hour overflow must return NULL"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn valid_mixed_sign_cancellation_without_overflow() -> Result<()> {
+        let days = Arc::new(Int32Array::from(vec![Some(1), Some(2), Some(0), Some(0)]))
+            as ArrayRef;
+        let hours = Arc::new(Int32Array::from(vec![
+            Some(-24),
+            Some(-48),
+            Some(1),
+            Some(0),
+        ])) as ArrayRef;
+        let mins = Arc::new(Int32Array::from(vec![Some(0), Some(0), Some(-60), Some(1)]))
+            as ArrayRef;
+        let secs = Arc::new(Float64Array::from(vec![
+            Some(0.0),
+            Some(0.0),
+            Some(0.0),
+            Some(-60.0),
+        ])) as ArrayRef;
+
+        let out = run_make_dt_interval(vec![days, hours, mins, secs])?;
+        let out = out
+            .as_any()
+            .downcast_ref::<DurationMicrosecondArray>()
+            .ok_or_else(|| {
+                internal_datafusion_err!("expected DurationMicrosecondArray")
+            })?;
+
+        assert_eq!(out.len(), 4);
+        for i in 0..4 {
+            assert!(!out.is_null(i));
+            assert_eq!(out.value(i), 0, "row {i} should be 0 us");
         }
         Ok(())
     }
