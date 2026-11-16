@@ -333,7 +333,7 @@ where
 }
 
 fn parse_day_of_week(day_of_week: &str) -> Option<Weekday> {
-    match day_of_week.to_ascii_uppercase().as_str() {
+    match day_of_week.to_uppercase().as_str() {
         "MO" | "MON" | "MONDAY" => Some(Weekday::Mon),
         "TU" | "TUE" | "TUESDAY" => Some(Weekday::Tue),
         "WE" | "WED" | "WEDNESDAY" => Some(Weekday::Wed),
@@ -785,5 +785,65 @@ mod tests {
         let date_arr = arr.as_primitive::<Date32Type>();
         assert!(date_arr.is_null(0));
         assert_eq!(date_arr.value(1), 19724);
+    }
+
+    #[test]
+    fn next_day_unicode_day_of_week_case_folding() {
+        let func = SparkNextDay::new();
+        let monday = 19723; // 2024-01-01
+
+        let make_args = |date: ScalarValue, dow: &str, ansi: bool| {
+            let mut config = ConfigOptions::default();
+            config.execution.enable_ansi_mode = ansi;
+            ScalarFunctionArgs {
+                args: vec![
+                    ColumnarValue::Scalar(date),
+                    ColumnarValue::Scalar(ScalarValue::Utf8(Some(dow.to_string()))),
+                ],
+                arg_fields: vec![
+                    Arc::new(Field::new("start_date", DataType::Date32, true)),
+                    Arc::new(Field::new("day_of_week", DataType::Utf8, true)),
+                ],
+                number_rows: 1,
+                return_field: Arc::new(Field::new("next_day", DataType::Date32, true)),
+                config_options: Arc::new(config),
+            }
+        };
+
+        // 'ſu' (Latin small letter long s) folds to 'SU' (Sunday -> 2024-01-07, epoch 19729)
+        for ansi in [true, false] {
+            let res = func
+                .invoke_with_args(make_args(
+                    ScalarValue::Date32(Some(monday)),
+                    "ſu",
+                    ansi,
+                ))
+                .unwrap();
+            let ColumnarValue::Scalar(ScalarValue::Date32(Some(val))) = res else {
+                panic!("expected Date32 scalar");
+            };
+            assert_eq!(
+                val, 19729,
+                "expected Sunday 2024-01-07 for 'ſu' (ansi={ansi})"
+            );
+        }
+
+        // 'frı' (Latin small letter dotless i) folds to 'FRI' (Friday -> 2024-01-05, epoch 19727)
+        for ansi in [true, false] {
+            let res = func
+                .invoke_with_args(make_args(
+                    ScalarValue::Date32(Some(monday)),
+                    "frı",
+                    ansi,
+                ))
+                .unwrap();
+            let ColumnarValue::Scalar(ScalarValue::Date32(Some(val))) = res else {
+                panic!("expected Date32 scalar");
+            };
+            assert_eq!(
+                val, 19727,
+                "expected Friday 2024-01-05 for 'frı' (ansi={ansi})"
+            );
+        }
     }
 }
