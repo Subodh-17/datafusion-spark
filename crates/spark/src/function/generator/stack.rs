@@ -21,6 +21,8 @@ use datafusion_expr::{
 };
 use datafusion_macros::user_doc;
 
+use crate::function::type_coercion::spark_sql_type;
+
 /// The most rows a call generates per batch. Spark streams the rows, but they are
 /// materialized here, so a large `n` such as `stack(2000000000, 1)` fails instead of
 /// exhausting memory.
@@ -198,29 +200,57 @@ fn column_types(
     for (i, arg_field) in arg_fields.iter().enumerate() {
         has_int32[i % num_fields] |= arg_field.data_type() == &DataType::Int32;
     }
-    let mut types = vec![DataType::Null; num_fields];
-    for (i, arg_field) in arg_fields.iter().enumerate() {
+    let actual_type = |i: usize| -> &DataType {
         let col = i % num_fields;
         let literal = scalar_arguments.get(i).copied().flatten();
-        let actual = if has_int32[col]
-            && arg_field.data_type() == &DataType::Int64
-            && literal.is_some_and(|literal| literal.cast_to(&DataType::Int32).is_ok())
+        if has_int32[col]
+            && arg_fields[i].data_type() == &DataType::Int64
+            && literal.is_some_and(|lit| lit.cast_to(&DataType::Int32).is_ok())
         {
             &DataType::Int32
         } else {
-            arg_field.data_type()
-        };
-        let expected = &mut types[col];
-        if expected.is_null() {
-            *expected = actual.clone();
-        } else if !actual.is_null() && !same_spark_type(actual, expected) {
+            arg_fields[i].data_type()
+        }
+    };
+
+    let is_null_literal = |i: usize| -> bool {
+        arg_fields[i].data_type().is_null()
+            && scalar_arguments.get(i).copied().flatten().is_some()
+    };
+
+    let mut types = Vec::with_capacity(num_fields);
+    for col in 0..num_fields {
+        if is_null_literal(col) {
+            // A literal NULL takes the type of the first non-null-literal in its column
+            let expected = (col..arg_fields.len())
+                .step_by(num_fields)
+                .find(|&i| !is_null_literal(i))
+                .map(actual_type)
+                .unwrap_or(&DataType::Null);
+            types.push(expected.clone());
+        } else {
+            types.push(actual_type(col).clone());
+        }
+    }
+
+    for (i, _) in arg_fields.iter().enumerate() {
+        if is_null_literal(i) {
+            continue;
+        }
+        let col = i % num_fields;
+        let actual = actual_type(i);
+        let expected = &types[col];
+        if !same_spark_type(actual, expected) {
             return plan_err!(
-                "The data type of the column ({col}) do not have the same type: \"{expected}\" ({}) <> \"{actual}\" ({}).",
+                "[DATATYPE_MISMATCH.STACK_COLUMN_DIFF_TYPES] The data type of the column ({col}) do not have the same type: \"{}\" ({}) <> \"{}\" ({}).",
+                spark_sql_type(expected),
                 col + 1,
+                spark_sql_type(actual),
                 i + 1
             );
         }
     }
+
     Ok(types)
 }
 
@@ -549,7 +579,11 @@ mod tests {
             1,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("\"Int32\" (1) <> \"Int16\" (2)"));
+        assert!(
+            err.to_string()
+                .contains("[DATATYPE_MISMATCH.STACK_COLUMN_DIFF_TYPES]")
+        );
+        assert!(err.to_string().contains("\"INT\" (1) <> \"SMALLINT\" (2)"));
         let big = ScalarValue::Int64(Some(0));
         let types = column_types(
             &fields([DataType::Int32, DataType::Int64]),
@@ -558,6 +592,99 @@ mod tests {
         )
         .unwrap();
         assert_eq!(types, [DataType::Int32]);
+    }
+
+    #[test]
+    fn test_column_types_rejects_null_typed_column() {
+        let fields = |types: [DataType; 2]| -> Vec<FieldRef> {
+            types.map(|t| Arc::new(Field::new("a", t, true))).to_vec()
+        };
+        // Typed column with NULL-typed table column (literal is None): rejected
+        let err =
+            column_types(&fields([DataType::Int32, DataType::Null]), &[None, None], 1)
+                .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("[DATATYPE_MISMATCH.STACK_COLUMN_DIFF_TYPES]")
+        );
+        assert!(err.to_string().contains(
+            "The data type of the column (0) do not have the same type: \"INT\" (1) <> \"VOID\" (2)."
+        ));
+
+        // Reverse argument order: rejected consistently
+        let err =
+            column_types(&fields([DataType::Null, DataType::Int32]), &[None, None], 1)
+                .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("[DATATYPE_MISMATCH.STACK_COLUMN_DIFF_TYPES]")
+        );
+        assert!(err.to_string().contains(
+            "The data type of the column (0) do not have the same type: \"VOID\" (1) <> \"INT\" (2)."
+        ));
+
+        // Mismatched column position 1
+        let fields4 = |types: [DataType; 4]| -> Vec<FieldRef> {
+            types.map(|t| Arc::new(Field::new("a", t, true))).to_vec()
+        };
+        let err = column_types(
+            &fields4([
+                DataType::Int32,
+                DataType::Int32,
+                DataType::Int32,
+                DataType::Null,
+            ]),
+            &[None, None, None, None],
+            2,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("[DATATYPE_MISMATCH.STACK_COLUMN_DIFF_TYPES]")
+        );
+        assert!(err.to_string().contains(
+            "The data type of the column (1) do not have the same type: \"INT\" (2) <> \"VOID\" (4)."
+        ));
+    }
+
+    #[test]
+    fn test_column_types_literal_null_coercion() {
+        let fields = |types: [DataType; 2]| -> Vec<FieldRef> {
+            types.map(|t| Arc::new(Field::new("a", t, true))).to_vec()
+        };
+        let null_scalar = ScalarValue::Null;
+        // Literal NULL before typed column: coerced to INT
+        let types = column_types(
+            &fields([DataType::Null, DataType::Int32]),
+            &[Some(&null_scalar), None],
+            1,
+        )
+        .unwrap();
+        assert_eq!(types, [DataType::Int32]);
+
+        // Literal NULL after typed column: coerced to INT
+        let types = column_types(
+            &fields([DataType::Int32, DataType::Null]),
+            &[None, Some(&null_scalar)],
+            1,
+        )
+        .unwrap();
+        assert_eq!(types, [DataType::Int32]);
+
+        // All literal NULLs: column type is Null
+        let types = column_types(
+            &fields([DataType::Null, DataType::Null]),
+            &[Some(&null_scalar), Some(&null_scalar)],
+            1,
+        )
+        .unwrap();
+        assert_eq!(types, [DataType::Null]);
+
+        // All NULL-typed table columns: column type is Null
+        let types =
+            column_types(&fields([DataType::Null, DataType::Null]), &[None, None], 1)
+                .unwrap();
+        assert_eq!(types, [DataType::Null]);
     }
 
     #[test]
