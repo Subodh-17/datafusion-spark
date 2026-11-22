@@ -39,17 +39,33 @@ SELECT array_contains(array(1, NULL, 3), 3);
 ----
 true
 
-# Null array -> null
-# xfail spark: Spark rejects an untyped NULL argument (NULL_TYPE), datafusion-spark returns NULL (https://github.com/apache/datafusion-spark/issues/367)
-query B
+# Untyped NULL array is rejected at planning time, as in Spark.
+query error \[DATATYPE_MISMATCH\.NULL_TYPE\] Null typed values cannot be used as arguments of `array_contains`
 SELECT array_contains(NULL, 1);
+
+# Untyped NULL element is rejected at planning time, as in Spark.
+query error \[DATATYPE_MISMATCH\.NULL_TYPE\] Null typed values cannot be used as arguments of `array_contains`
+SELECT array_contains(array(1, 2, 3), NULL);
+
+# Both untyped NULL arguments are rejected at planning time.
+query error \[DATATYPE_MISMATCH\.NULL_TYPE\] Null typed values cannot be used as arguments of `array_contains`
+SELECT array_contains(NULL, NULL);
+
+# Typed NULL array -> NULL
+query B
+SELECT array_contains(CAST(NULL AS ARRAY<INT>), 1);
 ----
 NULL
 
-# Null element -> null
-# xfail spark: Spark rejects an untyped NULL argument (NULL_TYPE), datafusion-spark returns NULL (https://github.com/apache/datafusion-spark/issues/367)
+# Typed NULL element -> NULL
 query B
-SELECT array_contains(array(1, 2, 3), NULL);
+SELECT array_contains(array(1, 2, 3), CAST(NULL AS INT));
+----
+NULL
+
+# Typed NULL array and element -> NULL
+query B
+SELECT array_contains(CAST(NULL AS ARRAY<INT>), CAST(NULL AS INT));
 ----
 NULL
 
