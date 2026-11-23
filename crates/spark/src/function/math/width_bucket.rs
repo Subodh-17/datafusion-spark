@@ -245,7 +245,7 @@ macro_rules! width_bucket_kernel_impl {
                 let h = ($to_f64)(max, i);
                 let buckets = n_bucket.value(i);
 
-                if buckets <= 0 {
+                if buckets <= 0 || buckets == i64::MAX {
                     b.append_null();
                     continue;
                 }
@@ -344,7 +344,7 @@ pub(crate) fn width_bucket_interval_mdn_exact(
             continue;
         }
         let buckets = n.value(i);
-        if buckets <= 0 {
+        if buckets <= 0 || buckets == i64::MAX {
             b.append_null();
             continue;
         }
@@ -414,7 +414,7 @@ fn bucket_from_f64(
     num_buckets: i64,
     ascending: bool,
 ) -> Option<i64> {
-    let next_bucket = num_buckets + 1;
+    let next_bucket = num_buckets.checked_add(1)?;
 
     if ascending {
         if x < l {
@@ -760,6 +760,76 @@ mod tests {
         let out = out.as_primitive::<Int64Type>();
         assert!(out.is_null(0));
         assert_eq!(out.value(1), 6);
+    }
+
+    #[test]
+    fn test_width_bucket_f64_bucket_count_boundaries() {
+        let v = f64_array(&[5.0; 6]);
+        let lo = f64_array(&[0.0; 6]);
+        let hi = f64_array(&[10.0; 6]);
+        let n = Arc::new(Int64Array::from(vec![
+            i64::MAX,
+            i64::MAX - 1,
+            i64::MIN,
+            0,
+            -1,
+            10,
+        ]));
+        let out = width_bucket_kern(&[v, lo, hi, n]).unwrap();
+        let out = out.as_primitive::<Int64Type>();
+        assert!(out.is_null(0));
+        assert_eq!(out.value(1), 4611686018427387905);
+        assert!(out.is_null(2));
+        assert!(out.is_null(3));
+        assert!(out.is_null(4));
+        assert_eq!(out.value(5), 6);
+    }
+
+    #[test]
+    fn test_width_bucket_duration_us_bucket_count_boundaries() {
+        let v = dur_us_array(&[500_000, 500_000, 500_000]);
+        let lo = dur_us_array(&[0, 0, 0]);
+        let hi = dur_us_array(&[1_000_000, 1_000_000, 1_000_000]);
+        let n = Arc::new(Int64Array::from(vec![i64::MAX, i64::MIN, 2]));
+        let out = width_bucket_kern(&[v, lo, hi, n]).unwrap();
+        let out = out.as_primitive::<Int64Type>();
+        assert!(out.is_null(0));
+        assert!(out.is_null(1));
+        assert_eq!(out.value(2), 2);
+    }
+
+    #[test]
+    fn test_width_bucket_interval_ym_bucket_count_boundaries() {
+        let v = ym_array(&[5, 5, 5]);
+        let lo = ym_array(&[0, 0, 0]);
+        let hi = ym_array(&[12, 12, 12]);
+        let n = Arc::new(Int64Array::from(vec![i64::MAX, i64::MIN, 12]));
+        let out = width_bucket_kern(&[v, lo, hi, n]).unwrap();
+        let out = out.as_primitive::<Int64Type>();
+        assert!(out.is_null(0));
+        assert!(out.is_null(1));
+        assert_eq!(out.value(2), 6);
+    }
+
+    #[test]
+    fn test_width_bucket_interval_mdn_bucket_count_boundaries() {
+        let v = mdn_array(&[(0, 5, 0), (0, 5, 0), (0, 5, 0)]);
+        let lo = mdn_array(&[(0, 0, 0), (0, 0, 0), (0, 0, 0)]);
+        let hi = mdn_array(&[(0, 10, 0), (0, 10, 0), (0, 10, 0)]);
+        let n = Arc::new(Int64Array::from(vec![i64::MAX, i64::MIN, 10]));
+        let out = width_bucket_kern(&[v, lo, hi, n]).unwrap();
+        let out = out.as_primitive::<Int64Type>();
+        assert!(out.is_null(0));
+        assert!(out.is_null(1));
+        assert_eq!(out.value(2), 6);
+
+        // Also test the months-only path of IntervalMonthDayNano
+        let v_m = mdn_array(&[(5, 0, 0)]);
+        let lo_m = mdn_array(&[(0, 0, 0)]);
+        let hi_m = mdn_array(&[(12, 0, 0)]);
+        let n_m = Arc::new(Int64Array::from(vec![i64::MAX]));
+        let out_m = width_bucket_kern(&[v_m, lo_m, hi_m, n_m]).unwrap();
+        assert!(out_m.as_primitive::<Int64Type>().is_null(0));
     }
 
     // --- Errores -------------------------------------------------------------

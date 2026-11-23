@@ -95,3 +95,19 @@ query I
 SELECT width_bucket(INTERVAL '1' YEAR, INTERVAL '5' YEAR, INTERVAL '5' YEAR, 10)
 ----
 NULL
+
+# num_buckets == i64::MAX returns NULL
+query I
+SELECT width_bucket(5.0, 0.0, 10.0, 9223372036854775807)
+----
+NULL
+
+query I
+SELECT width_bucket(INTERVAL '1' DAY, INTERVAL '0' DAY, INTERVAL '10' DAY, 9223372036854775807)
+----
+NULL
+
+query I
+SELECT width_bucket(INTERVAL '1' YEAR, INTERVAL '0' YEAR, INTERVAL '10' YEAR, 9223372036854775807)
+----
+NULL
