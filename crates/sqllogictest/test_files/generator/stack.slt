@@ -51,6 +51,7 @@ SELECT stack(2, NULL, NULL), arrow_typeof(stack(2, NULL, NULL));
 [{col0: NULL}, {col0: NULL}] List(Struct("col0": Null))
 
 # A NULL before a column is accepted and coerced to the column's type
+# xfail spark: intended: stack returns a list of structs for unnest, Spark's generator returns rows
 query ?
 SELECT stack(2, NULL, a) FROM (VALUES (1, NULL), (NULL, NULL)) AS t(a, b);
 ----
@@ -58,6 +59,7 @@ SELECT stack(2, NULL, a) FROM (VALUES (1, NULL), (NULL, NULL)) AS t(a, b);
 [{col0: NULL}, {col0: NULL}]
 
 # Reverse order: column followed by literal NULL is also accepted
+# xfail spark: intended: stack returns a list of structs for unnest, Spark's generator returns rows
 query ?
 SELECT stack(2, a, NULL) FROM (VALUES (1, NULL), (NULL, NULL)) AS t(a, b);
 ----
@@ -75,6 +77,14 @@ SELECT stack(2, b, a) FROM (VALUES (1, NULL), (NULL, NULL)) AS t(a, b);
 # Column position 1 with NULL-typed column is rejected with correct column index
 query error \[DATATYPE_MISMATCH\.STACK_COLUMN_DIFF_TYPES\] The data type of the column \(1\) do not have the same type
 SELECT stack(2, 1, a, 2, b) FROM (VALUES (1, NULL), (NULL, NULL)) AS t(a, b);
+
+# A NULL literal followed by a VOID column and a typed column reports the VOID position
+query error \[DATATYPE_MISMATCH\.STACK_COLUMN_DIFF_TYPES\] The data type of the column \(0\) do not have the same type: "INT" \(1\) <> "VOID" \(2\)\.
+SELECT stack(3, NULL, b, a) FROM (VALUES (1::INT, NULL), (NULL, NULL)) AS t(a, b);
+
+# A VOID column followed by a NULL literal and a typed column reports the NULL literal position
+query error \[DATATYPE_MISMATCH\.STACK_COLUMN_DIFF_TYPES\] The data type of the column \(0\) do not have the same type: "VOID" \(1\) <> "INT" \(2\)\.
+SELECT stack(3, b, NULL, a) FROM (VALUES (1::INT, NULL), (NULL, NULL)) AS t(a, b);
 
 # NULLs in a boolean column
 # xfail spark: intended: stack returns a list of structs for unnest, Spark's generator returns rows
