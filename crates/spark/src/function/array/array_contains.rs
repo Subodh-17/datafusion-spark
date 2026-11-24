@@ -4,7 +4,7 @@
 
 use crate::function::float_normalize::normalize_floats;
 use crate::function::type_coercion::{
-    is_orderable, spark_sql_type, struct_field_types_match, tightest_common_type,
+    is_orderable, spark_sql_type, struct_field_types_match, wider_type,
 };
 use arrow::array::{
     Array, AsArray, BooleanArray, BooleanBufferBuilder, GenericListArray, OffsetSizeTrait,
@@ -81,7 +81,7 @@ impl ScalarUDFImpl for SparkArrayContains {
     }
 }
 
-/// Casts the array element and the search element to their tightest common type, and rejects the
+/// Casts the array element and the search element to their wider type, and rejects the
 /// argument types that Spark's `ArrayContains.checkInputDataTypes` rejects.
 fn coerce_array_and_element(
     name: &str,
@@ -102,8 +102,8 @@ fn coerce_array_and_element(
             );
         }
     };
-    // Spark's `ArrayContains` calls the non-ANSI `TypeCoercion.findTightestCommonType`.
-    let common = tightest_common_type(item.data_type(), element, false)
+    // Spark's `ArrayContains.inputTypes` calls `TypeCoercion.findWiderTypeWithoutStringPromotionForTwo`.
+    let common = wider_type(item.data_type(), element, false)
         .filter(|_| struct_field_types_match(item.data_type(), element));
     let Some(common) = common else {
         return plan_err!(
@@ -303,7 +303,7 @@ mod tests {
     }
 
     #[test]
-    fn test_coerce_types_valid_typed_nulls() {
+    fn test_coerce_types_same_type() {
         let udf = SparkArrayContains::new();
         let array_type =
             DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
@@ -311,6 +311,42 @@ mod tests {
             .coerce_types(&[array_type.clone(), DataType::Int32])
             .unwrap();
         assert_eq!(coerced, vec![array_type, DataType::Int32]);
+    }
+
+    #[test]
+    fn test_coerce_types_decimal_widening() {
+        let udf = SparkArrayContains::new();
+        let array_type =
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
+        let coerced = udf
+            .coerce_types(&[array_type, DataType::Decimal128(2, 1)])
+            .unwrap();
+        let expected_common = DataType::Decimal128(11, 1);
+        let expected_array =
+            DataType::List(Arc::new(Field::new("item", expected_common.clone(), true)));
+        assert_eq!(coerced, vec![expected_array, expected_common]);
+    }
+
+    #[test]
+    fn test_coerce_types_nested_decimal_widening() {
+        let udf = SparkArrayContains::new();
+        let inner_array =
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
+        let outer_array = DataType::List(Arc::new(Field::new("item", inner_array, true)));
+        let search_element = DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Decimal128(2, 1),
+            true,
+        )));
+        let coerced = udf.coerce_types(&[outer_array, search_element]).unwrap();
+        let expected_inner = DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Decimal128(21, 1),
+            true,
+        )));
+        let expected_outer =
+            DataType::List(Arc::new(Field::new("item", expected_inner.clone(), true)));
+        assert_eq!(coerced, vec![expected_outer, expected_inner]);
     }
 
     #[test]
